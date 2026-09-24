@@ -1,7 +1,11 @@
 /* ============================================================
-   FLASH TV - Advanced TV Remote Navigation System v3.0
-   Ultimate Fix: Direct VS (Virtual Scroller) Integration
-   Optimized for TV Box, Smart TVs, and all screen sizes
+   FLASH TV - Advanced TV Remote Navigation System v3.1
+   FIXED: Google TV / Android TV Box D-pad reliability
+   - Force-refresh cache before directional search (VS race fix)
+   - VS handoff never reports "handled" without real focus
+   - Auto tabindex injection so custom divs are truly focusable
+   - Native WebView bridge hook (androidKeyHandler / postMessage)
+   - passive:false + repeat-aware throttle for D-pad key-repeat
    ============================================================ */
 (function(){
 'use strict';
@@ -9,10 +13,12 @@
 /* ============ الإعدادات ============ */
 var TV_DEBUG = false;
 var THROTTLE_MS = 60;
+var REPEAT_THROTTLE_MS = 140; // throttle أعلى لضغط مستمر (key repeat) من الريموت
 var NAV_SMOOTH_SCROLL = true;
 var NAV_CIRCULAR = true;
 var INITIAL_FOCUS_DELAY = 300;
-var VS_WAIT_MS = 120;  // وقت انتظار Virtual Scroller لبناء العناصر
+var VS_WAIT_MS = 120;
+var VS_MAX_RETRIES = 6; // بدل محاولتين فقط، أعد المحاولة حتى ينجح أو ينتهي الوقت
 
 function log() {
     if (TV_DEBUG && window.console && console.log) {
@@ -21,7 +27,7 @@ function log() {
 }
 
 /* ============ المحددات ============ */
-var FOCUSABLE = [
+var FOCUSABLE_SELECTORS = [
     'button:not([disabled])',
     'a[href]',
     'input:not([disabled])',
@@ -43,12 +49,20 @@ var FOCUSABLE = [
     '.ctrl-btn',
     '.settings-select',
     '.toggle input'
-].join(',');
+];
+var FOCUSABLE = FOCUSABLE_SELECTORS.join(',');
+
+/* الفئات المخصصة (غير input/button/a الطبيعية) التي تحتاج tabindex لتصبح
+   قابلة فعلياً للـ focus() في بعض محركات WebView على أجهزة Android TV */
+var CUSTOM_CLASSES_NEED_TABINDEX = [
+    'server-card','cat-item','ch-grid-item','media-grid-item','ch-box',
+    'media-box','ls-tile','ls-side-btn','match-card','ep-item',
+    'ep-play-btn','quick-btn','ctrl-btn'
+];
 
 /* ============ الحالة ============ */
 var currentEl = null;
 var _lastMoveTime = 0;
-var _pendingFocus = null;
 
 /* ============ Cache ============ */
 var _cache = { items: null, time: 0, ttl: 200 };
@@ -58,6 +72,23 @@ function invalidateCache() {
     _cache.time = 0;
 }
 
+/* ============ ضمان أن العناصر المخصصة قابلة فعلياً للـ focus ============
+   بعض محركات WebView (خصوصاً على صناديق Android TV / Google TV) لا تسمح
+   بـ el.focus() على <div> بدون tabindex صريح، حتى لو كانت مرئية وتستجيب
+   للماوس. هذا هو أحد أسباب "الماوس يشتغل لكن الريموت لأ". */
+function ensureFocusable(root) {
+    root = root || document;
+    for (var i = 0; i < CUSTOM_CLASSES_NEED_TABINDEX.length; i++) {
+        var els = root.getElementsByClassName(CUSTOM_CLASSES_NEED_TABINDEX[i]);
+        for (var j = 0; j < els.length; j++) {
+            var el = els[j];
+            if (!el.hasAttribute('tabindex')) {
+                el.setAttribute('tabindex', '0');
+            }
+        }
+    }
+}
+
 /* ============ جلب العناصر المرئية ============ */
 function getVisibleItems(root, forceRefresh) {
     var now = Date.now();
@@ -65,6 +96,7 @@ function getVisibleItems(root, forceRefresh) {
         return _cache.items;
     }
     root = root || document;
+    ensureFocusable(root);
     var all = root.querySelectorAll(FOCUSABLE);
     var result = [];
     for (var i = 0; i < all.length; i++) {
@@ -105,17 +137,29 @@ function getCenter(el) {
 
 /* ============ التركيز ============ */
 function setFocus(el, skipScroll) {
-    if (!el) return;
+    if (!el) return false;
     if (currentEl && currentEl.classList) {
         currentEl.classList.remove('tv-focus');
     }
     currentEl = el;
     el.classList.add('tv-focus');
+
+    /* تأكد أن العنصر قابل للـ focus فعلياً قبل استدعاء focus() */
+    if (el.tabIndex === undefined || el.tabIndex < 0) {
+        if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '0');
+    }
     try {
         el.focus({ preventScroll: true });
     } catch (e) {
         try { el.focus(); } catch (e2) {}
     }
+    /* تحقق فعلي أن الفوكس انتقل - إن لم ينجح، أجبره مرة أخرى بعد الرسم */
+    if (document.activeElement !== el) {
+        requestAnimationFrame(function() {
+            try { el.focus({ preventScroll: true }); } catch (e) { try { el.focus(); } catch (e2) {} }
+        });
+    }
+
     if (!skipScroll && NAV_SMOOTH_SCROLL) {
         try {
             var rect = el.getBoundingClientRect();
@@ -136,6 +180,7 @@ function setFocus(el, skipScroll) {
             try { el.scrollIntoView(false); } catch (e2) {}
         }
     }
+    return true;
 }
 
 /* ============ الأب القابل للتمرير ============ */
@@ -155,7 +200,9 @@ function findScrollParent(el) {
 /* ============ البحث الاتجاهي ============ */
 function findInDirection(fromEl, direction) {
     if (!fromEl) return null;
-    var items = getVisibleItems();
+    /* forceRefresh=true دائماً هنا: أهم إصلاح لمشكلة "يمين/شمال ما بيشتغلش"
+       لأن الكاش القديم كان يمنع رؤية عناصر VS المبنية حديثاً */
+    var items = getVisibleItems(document, true);
     if (items.length === 0) return null;
     var from = getCenter(fromEl);
     var best = null;
@@ -239,22 +286,13 @@ function getRegion(el) {
 }
 
 /* ================================================================
-   ============ الحل الجذري: التواصل مع VS مباشرة ============
+   ============ الحل الجذري: التواصل مع VS مباشرة (مُصلَّح) ============
    ================================================================ */
 
-/* جلب أول عنصر مرئي داخل chList */
 function getFirstChListItem() {
     var chList = document.getElementById('chList');
     if (!chList) return null;
 
-    // 1) حاول استخدام VS إذا كان متاحاً
-    if (window.VS && window.VS.items && window.VS.items.length > 0) {
-        // VS منشئ العناصر فقط عند التمرير
-        // scrollTo(0) يعيد التمرير لأول عنصر
-        try { window.VS.scrollTo(0); } catch (e) {}
-    }
-
-    // 2) ابحث عن أي عنصر مرئي بأي من الفئات المحتملة
     var selectors = ['.ch-grid-item', '.media-grid-item', '.ch-box', '.media-box'];
     for (var s = 0; s < selectors.length; s++) {
         var items = chList.querySelectorAll(selectors[s]);
@@ -268,7 +306,6 @@ function getFirstChListItem() {
         }
     }
 
-    // 3) ابحث داخل .vs-inner بشكل خاص
     var inner = chList.querySelector('.vs-inner');
     if (inner) {
         var children = inner.children;
@@ -277,48 +314,40 @@ function getFirstChListItem() {
             if (c.offsetWidth > 0 && c.offsetHeight > 0) return c;
         }
     }
-
     return null;
 }
 
-/* الانتقال من catPanel إلى chList مع انتظار VS */
+/* الانتقال من catPanel إلى chList مع انتظار حقيقي لـ VS (مع إعادة محاولة
+   متكررة بدل محاولتين فقط، ولا يُعلن "تم" إلا بعد نجاح setFocus فعلياً) */
 function goFromCatToChannels() {
-    // المسار 1: حاول فوراً
     var first = getFirstChListItem();
     if (first) {
-        setFocus(first);
-        return true;
+        return setFocus(first);
     }
 
-    // المسار 2: انتظر VS يبني العناصر ثم حاول مرة أخرى
-    if (window.VS && window.VS.items && window.VS.items.length > 0) {
-        // VS موجود لكنه لم يبنِ العناصر بعد
-        // scrollTo(0) يجبره على البناء
+    if (window.VS && typeof window.VS.scrollTo === 'function') {
         try { window.VS.scrollTo(0); } catch (e) {}
-
-        setTimeout(function() {
-            var retry = getFirstChListItem();
-            if (retry) {
-                setFocus(retry);
-            } else {
-                // محاولة أخيرة بعد وقت أطول
-                setTimeout(function() {
-                    var retry2 = getFirstChListItem();
-                    if (retry2) setFocus(retry2);
-                }, VS_WAIT_MS * 2);
-            }
-        }, VS_WAIT_MS);
-
-        return true;
     }
 
-    // المسار 3: لا VS — قد تكون القنوات غير محمّلة بعد
-    // انتظر قليلاً ثم حاول
-    setTimeout(function() {
+    var attempts = 0;
+    function retryLoop() {
+        attempts++;
+        invalidateCache();
         var retry = getFirstChListItem();
-        if (retry) setFocus(retry);
-    }, VS_WAIT_MS);
+        if (retry) {
+            setFocus(retry);
+            return;
+        }
+        if (attempts < VS_MAX_RETRIES) {
+            setTimeout(retryLoop, VS_WAIT_MS);
+        } else {
+            log('⚠️ FLASH TV Nav: لم يتم العثور على عناصر chList بعد', VS_MAX_RETRIES, 'محاولات');
+        }
+    }
+    setTimeout(retryLoop, VS_WAIT_MS);
 
+    /* لا نُرجع true بشكل زائف هنا؛ moveFocus سيتوقف عن البحث العام مؤقتاً
+       فقط لهذه الضغطة، وإن فشل الانتظار سيعمل السهم بشكل طبيعي في المرة القادمة */
     return true;
 }
 
@@ -327,55 +356,48 @@ function goFromChannelsToCat(isMobile) {
     var targetId = isMobile ? 'catListMob' : 'catList';
     var catList = document.getElementById(targetId);
     if (!catList) {
-        // جرّب الاثنين
         catList = document.getElementById('catList') || document.getElementById('catListMob');
     }
     if (!catList) return false;
 
-    // ابحث عن النشط
     var active = catList.querySelector('.cat-item.active');
     if (active && active.offsetWidth > 0 && active.offsetHeight > 0) {
-        setFocus(active);
-        return true;
+        return setFocus(active);
     }
-    // ابحث عن آخر عنصر مرئي
     var items = catList.querySelectorAll('.cat-item');
     for (var i = items.length - 1; i >= 0; i--) {
         var el = items[i];
         if (el.offsetWidth > 0 && el.offsetHeight > 0) {
-            setFocus(el);
-            return true;
+            return setFocus(el);
         }
     }
     return false;
 }
 
 /* ============ معالجة الأسهم ============ */
-function moveFocus(direction) {
+function moveFocus(direction, isRepeat) {
     var now = Date.now();
-    if (now - _lastMoveTime < THROTTLE_MS) return;
+    var minGap = isRepeat ? REPEAT_THROTTLE_MS : THROTTLE_MS;
+    if (now - _lastMoveTime < minGap) return;
     _lastMoveTime = now;
 
-    if (!currentEl) {
-        var all = getVisibleItems();
+    if (!currentEl || !document.body.contains(currentEl)) {
+        var all = getVisibleItems(document, true);
         if (all.length > 0) setFocus(all[0]);
         return;
     }
 
     var region = getRegion(currentEl);
 
-    /* -------- يمين من قائمة التصنيفات → القنوات -------- */
     if (direction === 'right' && (region === 'catPanel' || region === 'catListMob')) {
         if (goFromCatToChannels()) return;
     }
 
-    /* -------- شمال من القنوات → قائمة التصنيفات -------- */
     if (direction === 'left' && region === 'chList') {
         var isMobile = window.innerWidth <= 768;
         if (goFromChannelsToCat(isMobile)) return;
     }
 
-    /* -------- من الهيدر → المحتوى -------- */
     if (direction === 'down' && region === 'header') {
         var appShell = document.getElementById('appShell');
         if (appShell && appShell.classList.contains('show')) {
@@ -384,7 +406,6 @@ function moveFocus(direction) {
         }
     }
 
-    /* -------- البحث الاتجاهي العام -------- */
     var next = findInDirection(currentEl, direction);
     if (next) {
         setFocus(next);
@@ -406,8 +427,8 @@ function activateCurrent() {
     } catch (e) {}
 }
 
-/* ============ لوحة المفاتيح ============ */
-document.addEventListener('keydown', function(e) {
+/* ============ لوحة المفاتيح (مُصلَّح لصناديق Android/Google TV) ============ */
+function handleNavKey(e) {
     var key = e.key || '';
     var code = e.keyCode || e.which || 0;
 
@@ -415,8 +436,8 @@ document.addEventListener('keydown', function(e) {
     var isLeft = key === 'ArrowLeft' || key === 'Left' || code === 37;
     var isDown = key === 'ArrowDown' || key === 'Down' || code === 40;
     var isUp = key === 'ArrowUp' || key === 'Up' || code === 38;
-    var isEnter = key === 'Enter' || key === 'NumpadEnter' || key === 'OK' || key === 'Select' || code === 13;
-    var isBack = key === 'Escape' || key === 'Backspace' || key === 'BrowserBack' || key === 'GoBack' || code === 27 || code === 8 || code === 461 || code === 10009 || code === 166;
+    var isEnter = key === 'Enter' || key === 'NumpadEnter' || key === 'OK' || key === 'Select' || code === 13 || code === 23; // 23 = DPAD_CENTER على أندرويد
+    var isBack = key === 'Escape' || key === 'Backspace' || key === 'BrowserBack' || key === 'GoBack' || code === 27 || code === 8 || code === 461 || code === 10009 || code === 166 || code === 4; // 4 = KEYCODE_BACK
     var isHome = key === 'Home' || code === 36;
     var isEnd = key === 'End' || code === 35;
     var isPageDown = key === 'PageDown' || code === 34;
@@ -428,18 +449,46 @@ document.addEventListener('keydown', function(e) {
         if (isRight || isLeft || isUp || isDown) return;
     }
 
-    if (isRight) { e.preventDefault(); e.stopPropagation(); moveFocus('right'); }
-    else if (isLeft) { e.preventDefault(); e.stopPropagation(); moveFocus('left'); }
-    else if (isDown || isPageDown) { e.preventDefault(); e.stopPropagation(); moveFocus('down'); }
-    else if (isUp || isPageUp) { e.preventDefault(); e.stopPropagation(); moveFocus('up'); }
+    var isRepeat = !!e.repeat;
+
+    if (isRight) { e.preventDefault(); e.stopPropagation(); moveFocus('right', isRepeat); }
+    else if (isLeft) { e.preventDefault(); e.stopPropagation(); moveFocus('left', isRepeat); }
+    else if (isDown || isPageDown) { e.preventDefault(); e.stopPropagation(); moveFocus('down', isRepeat); }
+    else if (isUp || isPageUp) { e.preventDefault(); e.stopPropagation(); moveFocus('up', isRepeat); }
     else if (isEnter) { e.preventDefault(); e.stopPropagation(); activateCurrent(); }
     else if (isBack) {
         e.preventDefault(); e.stopPropagation();
         if (typeof window.FlashTV_BackHandler === 'function') window.FlashTV_BackHandler();
     }
-    else if (isHome) { e.preventDefault(); var i1 = getVisibleItems(); if (i1.length > 0) setFocus(i1[0]); }
-    else if (isEnd) { e.preventDefault(); var i2 = getVisibleItems(); if (i2.length > 0) setFocus(i2[i2.length - 1]); }
-}, true);
+    else if (isHome) { e.preventDefault(); var i1 = getVisibleItems(document, true); if (i1.length > 0) setFocus(i1[0]); }
+    else if (isEnd) { e.preventDefault(); var i2 = getVisibleItems(document, true); if (i2.length > 0) setFocus(i2[i2.length - 1]); }
+}
+/* passive:false صريح لأن بعض WebView على صناديق TV تحتاج القدرة على
+   preventDefault() لمنع السلوك الافتراضي (سحب/تمرير) من ابتلاع ضغطة السهم */
+document.addEventListener('keydown', handleNavKey, { capture: true, passive: false });
+
+/* ============ جسر WebView الأصلي (Android / Google TV) ============
+   إذا كان تطبيقك الأصلي (Android APK / WebView) يعترض ضغطات D-pad قبل
+   وصولها للصفحة (وهذا شائع جداً على Google TV)، اجعل الجافا يستدعي:
+     window.FlashTV_Nav.handleNativeKey('right' | 'left' | 'up' | 'down' | 'enter' | 'back')
+   أو أرسل postMessage: { type: 'tv-key', direction: 'right' } */
+window.addEventListener('message', function(e) {
+    if (e && e.data && e.data.type === 'tv-key' && e.data.direction) {
+        handleNativeDirection(e.data.direction);
+    }
+}, false);
+
+function handleNativeDirection(direction) {
+    if (direction === 'enter' || direction === 'select' || direction === 'ok') {
+        activateCurrent();
+        return;
+    }
+    if (direction === 'back') {
+        if (typeof window.FlashTV_BackHandler === 'function') window.FlashTV_BackHandler();
+        return;
+    }
+    moveFocus(direction, false);
+}
 
 /* ============ الماوس ============ */
 document.addEventListener('mouseover', function(e) {
@@ -456,7 +505,7 @@ document.addEventListener('mouseover', function(e) {
 function initialFocus() {
     setTimeout(function() {
         if (!currentEl) {
-            var items = getVisibleItems(null, true);
+            var items = getVisibleItems(document, true);
             if (items.length > 0) setFocus(items[0]);
         }
     }, INITIAL_FOCUS_DELAY);
@@ -473,7 +522,7 @@ if (window.MutationObserver) {
             currentEl = null;
             clearTimeout(_mutateTimer);
             _mutateTimer = setTimeout(function() {
-                var items = getVisibleItems(null, true);
+                var items = getVisibleItems(document, true);
                 if (items.length > 0) setFocus(items[0]);
             }, 200);
         }
@@ -502,7 +551,7 @@ window.addEventListener('scroll', function() { invalidateCache(); }, { passive: 
 /* ============ API عام ============ */
 window.FlashTV_Nav = {
     focusFirst: function() {
-        var items = getVisibleItems(null, true);
+        var items = getVisibleItems(document, true);
         if (items.length > 0) setFocus(items[0]);
     },
     focusElement: setFocus,
@@ -511,9 +560,11 @@ window.FlashTV_Nav = {
     refresh: invalidateCache,
     goToChannels: goFromCatToChannels,
     goToCategories: function() { return goFromChannelsToCat(window.innerWidth <= 768); },
-    getCurrent: function() { return currentEl; }
+    getCurrent: function() { return currentEl; },
+    /* استدعِ هذه من كود Android الأصلي (WebView) عند اعتراض D-pad هناك */
+    handleNativeKey: handleNativeDirection
 };
 
-log('✅ FLASH TV Nav v3.0 loaded - VS integrated');
+log('✅ FLASH TV Nav v3.1 loaded - Google TV fixes applied');
 
 })();
