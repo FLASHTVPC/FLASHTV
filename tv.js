@@ -1,27 +1,47 @@
 /* ============================================================
-   FLASH TV - Advanced TV Remote Navigation System v3.2
-   MERGED & FINAL:
-   ✓ Android D-pad keycodes (19/20/21/22) + e.code + e.key
-   ✓ Per-direction throttle + repeat-aware
-   ✓ WebView native bridge (postMessage + handleNativeKey)
-   ✓ tabindex injection for custom divs
-   ✓ Force-refresh cache + currentEl sync + rAF focus verify
-   ✓ passive:false for TV WebView preventDefault
+   FLASH TV - TV Remote Navigation v3.3 (FINAL)
+   - يدعم كل أكواد Android TV / Google TV / Fire TV
+   - يكتشف الأكواد تلقائياً لو الريموت غريب
+   - يمنع circular wrap المربك
    ============================================================ */
 (function(){
 'use strict';
 
-var TV_DEBUG = false;
-var THROTTLE_MS = 30;
-var REPEAT_THROTTLE_MS = 90;
+var TV_DEBUG = true;   // ← خليها true مؤقتاً لحد ما نحل المشكلة
+var THROTTLE_MS = 40;
+var REPEAT_THROTTLE_MS = 100;
 var NAV_SMOOTH_SCROLL = true;
-var NAV_CIRCULAR = true;
+var NAV_CIRCULAR = false;  // ← عطّلها مؤقتاً عشان نتأكد إن مش هي السبب
 var INITIAL_FOCUS_DELAY = 350;
 var VS_WAIT_MS = 100;
 var VS_MAX_RETRIES = 8;
 
+/* ============ اكتشاف ديناميكي لأكواد الريموت ============ */
+var KeyMap = {
+    right: [39, 22, 'ArrowRight', 'Right', 'DPAD_RIGHT'],
+    left:  [37, 21, 'ArrowLeft',  'Left',  'DPAD_LEFT'],
+    down:  [40, 20, 'ArrowDown',  'Down',  'DPAD_DOWN'],
+    up:    [38, 19, 'ArrowUp',    'Up',    'DPAD_UP']
+};
+
 function log(){ if(TV_DEBUG&&window.console&&console.log) console.log.apply(console,arguments); }
 
+function matchDirection(key, code, keyCode, which){
+    for(var dir in KeyMap){
+        var list = KeyMap[dir];
+        for(var i=0;i<list.length;i++){
+            var v = list[i];
+            if(typeof v === 'number'){
+                if(code===v || keyCode===v || which===v) return dir;
+            } else {
+                if(key===v || code===v) return dir;
+            }
+        }
+    }
+    return null;
+}
+
+/* ============ المحددات ============ */
 var FOCUSABLE_SELECTORS = [
     'button:not([disabled])','a[href]','input:not([disabled])','select:not([disabled])',
     '[role="button"]:not([disabled])','[tabindex]:not([tabindex="-1"])',
@@ -40,8 +60,8 @@ var CUSTOM_CLASSES_NEED_TABINDEX = [
 var currentEl = null;
 var _lastMoveTime = 0;
 var _lastDir = '';
-
 var _cache = { items:null, time:0, ttl:80 };
+
 function invalidateCache(){ _cache.items=null; _cache.time=0; }
 
 function ensureFocusable(root){
@@ -66,13 +86,13 @@ function getVisibleItems(root, forceRefresh){
         try{
             if(el.disabled) continue;
             if(el.getAttribute && el.getAttribute('aria-hidden')==='true') continue;
-            var style = window.getComputedStyle(el);
-            if(style.display==='none'||style.visibility==='hidden') continue;
-            if(parseFloat(style.opacity)===0) continue;
-            if(style.pointerEvents==='none') continue;
+            var st = window.getComputedStyle(el);
+            if(st.display==='none'||st.visibility==='hidden') continue;
+            if(parseFloat(st.opacity)===0) continue;
+            if(st.pointerEvents==='none') continue;
             if(el.offsetWidth===0||el.offsetHeight===0) continue;
-            var rect = el.getBoundingClientRect();
-            if(rect.width<2||rect.height<2) continue;
+            var r = el.getBoundingClientRect();
+            if(r.width<2||r.height<2) continue;
             result.push(el);
         }catch(e){}
     }
@@ -129,6 +149,7 @@ function setFocus(el, skipScroll){
         }catch(e){ try{ el.scrollIntoView(false); }catch(e2){} }
     }
     invalidateCache();
+    log('🎯 Focus →', el.tagName, el.className || el.id);
     return true;
 }
 
@@ -233,7 +254,6 @@ function goFromCatToChannels(){
         var el = getFirstChListItem();
         if(el){ setFocus(el); return; }
         if(attempts < VS_MAX_RETRIES) setTimeout(retryLoop, VS_WAIT_MS);
-        else log('⚠️ chList elements not found after', VS_MAX_RETRIES, 'retries');
     }
     setTimeout(retryLoop, VS_WAIT_MS);
     return true;
@@ -258,12 +278,10 @@ function goFromChannelsToCat(isMobile){
 function moveFocus(direction, isRepeat){
     var now = Date.now();
     var minGap = isRepeat ? REPEAT_THROTTLE_MS : THROTTLE_MS;
-    /* per-direction throttle: نفس الاتجاه يُكتم، الاتجاه المعاكس يمر */
     if(direction===_lastDir && (now-_lastMoveTime)<minGap) return;
     _lastMoveTime = now;
     _lastDir = direction;
 
-    /* مزامنة currentEl مع activeElement */
     if((!currentEl || !document.body.contains(currentEl)) &&
        document.activeElement && document.activeElement!==document.body){
         currentEl = document.activeElement;
@@ -292,6 +310,7 @@ function moveFocus(direction, isRepeat){
 
     var next = findInDirection(currentEl, direction);
     if(next) setFocus(next);
+    else log('⚠️ No element found in direction:', direction);
 }
 
 function activateCurrent(){
@@ -307,70 +326,78 @@ function activateCurrent(){
     }catch(e){}
 }
 
-/* ============ KEY HANDLING (الإصلاح الرئيسي) ============ */
+/* ============ KEY HANDLER (مع تشخيص) ============ */
 function handleNavKey(e){
     if(e.isComposing) return;
-    var key  = e.key || '';
-    var code = e.keyCode || e.which || 0;
-    var ec   = e.code || '';
+    var key     = e.key || '';
+    var code    = e.code || '';
+    var keyCode = e.keyCode || e.which || 0;
+    var which   = e.which || 0;
 
-    /* دعم كل الحالات:
-       - Web عادي: 37/38/39/40 + ArrowRight/Left/Up/Down
-       - Android TV D-pad: 19/20/21/22
-       - e.code (لمّا e.key = 'Unidentified') */
-    var isRight = key==='ArrowRight'||key==='Right'||code===39||code===22||ec==='ArrowRight';
-    var isLeft  = key==='ArrowLeft' ||key==='Left' ||code===37||code===21||ec==='ArrowLeft';
-    var isDown  = key==='ArrowDown' ||key==='Down' ||code===40||code===20||ec==='ArrowDown';
-    var isUp    = key==='ArrowUp'   ||key==='Up'   ||code===38||code===19||ec==='ArrowUp';
-    var isEnter = key==='Enter'||key==='NumpadEnter'||key==='OK'||key==='Select'||key==='Accept'||key==='Go'
-                  ||code===13||code===23||ec==='Enter'||ec==='NumpadEnter'||ec==='Space'
-                  ||key===' '||code===32;
-    var isBack  = key==='Escape'||key==='Backspace'||key==='BrowserBack'||key==='GoBack'
-                  ||code===27||code===8||code===461||code===10009||code===166||code===4
-                  ||ec==='Escape'||ec==='BrowserBack';
-    var isHome  = key==='Home'||code===36;
-    var isEnd   = key==='End'||code===35;
-    var isPageDown = key==='PageDown'||code===34;
-    var isPageUp   = key==='PageUp'||code===33;
+    if(TV_DEBUG){
+        console.log('[TV-KEY]',
+            'key=' + JSON.stringify(key),
+            'code=' + JSON.stringify(code),
+            'keyCode=' + keyCode,
+            'which=' + which);
+    }
+
+    /* Back / Enter بأكواد متعددة */
+    var isEnter = key==='Enter'||key==='NumpadEnter'||key==='OK'||key==='Select'||
+                  key==='Accept'||key==='Go'||key===' '||
+                  code==='Enter'||code==='NumpadEnter'||code==='Space'||
+                  keyCode===13||keyCode===23||keyCode===32;
+
+    var isBack = key==='Escape'||key==='Backspace'||key==='BrowserBack'||key==='GoBack'||
+                 code==='Escape'||code==='BrowserBack'||
+                 keyCode===27||keyCode===8||keyCode===4||
+                 keyCode===461||keyCode===10009||keyCode===166;
+
+    /* الاتجاهات - باستخدام المطابقة الديناميكية */
+    var dir = matchDirection(key, code, keyCode, which);
+    var isPageDown = key==='PageDown'||code==='PageDown'||keyCode===34;
+    var isPageUp   = key==='PageUp'  ||code==='PageUp'  ||keyCode===33;
 
     var active = document.activeElement;
-    var tag = active?active.tagName:'';
+    var tag = active ? active.tagName : '';
     var isEditable = (tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||(active&&active.isContentEditable));
-    if(isEditable && !isEnter){
-        if(isRight||isLeft||isUp||isDown) return;
+    if(isEditable && !isEnter && !isBack){
+        if(dir) return;
     }
 
     var isRepeat = !!e.repeat;
 
-    if(isRight){ e.preventDefault(); e.stopPropagation(); moveFocus('right', isRepeat); }
-    else if(isLeft){ e.preventDefault(); e.stopPropagation(); moveFocus('left', isRepeat); }
-    else if(isDown||isPageDown){ e.preventDefault(); e.stopPropagation(); moveFocus('down', isRepeat); }
-    else if(isUp||isPageUp){ e.preventDefault(); e.stopPropagation(); moveFocus('up', isRepeat); }
+    if(dir === 'right'){ e.preventDefault(); e.stopPropagation(); moveFocus('right', isRepeat); }
+    else if(dir === 'left'){ e.preventDefault(); e.stopPropagation(); moveFocus('left', isRepeat); }
+    else if(dir === 'down' || isPageDown){ e.preventDefault(); e.stopPropagation(); moveFocus('down', isRepeat); }
+    else if(dir === 'up'   || isPageUp){ e.preventDefault(); e.stopPropagation(); moveFocus('up', isRepeat); }
     else if(isEnter){ e.preventDefault(); e.stopPropagation(); activateCurrent(); }
     else if(isBack){
         e.preventDefault(); e.stopPropagation();
-        if(typeof window.FlashTV_BackHandler==='function') window.FlashTV_BackHandler();
+        if(typeof window.FlashTV_BackHandler === 'function'){
+            window.FlashTV_BackHandler();
+        } else {
+            log('⚠️ FlashTV_BackHandler غير معرّف - لا يمكن معالجة زر الرجوع');
+        }
     }
-    else if(isHome){ e.preventDefault(); var i1=getVisibleItems(document,true); if(i1.length>0) setFocus(i1[0]); }
-    else if(isEnd){ e.preventDefault(); var i2=getVisibleItems(document,true); if(i2.length>0) setFocus(i2[i2.length-1]); }
 }
 document.addEventListener('keydown', handleNavKey, { capture:true, passive:false });
 
-/* ============ WebView Bridge (Android / Google TV APK) ============ */
+/* ============ WebView Bridge ============ */
+function handleNativeDirection(direction){
+    if(direction==='enter'||direction==='select'||direction==='ok'){ activateCurrent(); return; }
+    if(direction==='back'){
+        if(typeof window.FlashTV_BackHandler === 'function') window.FlashTV_BackHandler();
+        return;
+    }
+    moveFocus(direction, false);
+}
+
 window.addEventListener('message', function(e){
     if(e && e.data && e.data.type==='tv-key' && e.data.direction){
         handleNativeDirection(e.data.direction);
     }
 }, false);
-
-function handleNativeDirection(direction){
-    if(direction==='enter'||direction==='select'||direction==='ok'){ activateCurrent(); return; }
-    if(direction==='back'){
-        if(typeof window.FlashTV_BackHandler==='function') window.FlashTV_BackHandler();
-        return;
-    }
-    moveFocus(direction, false);
-}
 
 /* ============ الماوس ============ */
 document.addEventListener('mouseover', function(e){
@@ -415,7 +442,6 @@ if(window.MutationObserver){
     });
 }
 
-/* ============ resize ============ */
 var _rz = null;
 window.addEventListener('resize', function(){
     clearTimeout(_rz);
@@ -424,7 +450,6 @@ window.addEventListener('resize', function(){
         if(currentEl && document.body.contains(currentEl)) setFocus(currentEl, true);
     }, 200);
 });
-
 window.addEventListener('scroll', function(){ invalidateCache(); }, { passive:true, capture:true });
 
 /* ============ API ============ */
@@ -440,6 +465,6 @@ window.FlashTV_Nav = {
     handleNativeKey: handleNativeDirection
 };
 
-log('✅ FLASH TV Nav v3.2 loaded - FULL Android/Google TV support');
+log('✅ FLASH TV Nav v3.3 loaded - NAV_CIRCULAR=' + NAV_CIRCULAR + ' DEBUG=' + TV_DEBUG);
 
 })();
