@@ -1,5 +1,6 @@
 /* ============================================================
-   FLASH TV - Advanced TV Remote Navigation System v2.0
+   FLASH TV - Advanced TV Remote Navigation System v3.0
+   Ultimate Fix: Direct VS (Virtual Scroller) Integration
    Optimized for TV Box, Smart TVs, and all screen sizes
    ============================================================ */
 (function(){
@@ -7,10 +8,11 @@
 
 /* ============ الإعدادات ============ */
 var TV_DEBUG = false;
-var THROTTLE_MS = 80;         // منع تكرار ضغطات الأسهم السريعة
-var NAV_SMOOTH_SCROLL = true; // تمرير سلس
-var NAV_CIRCULAR = true;      // تنقل دائري عند الوصول للحافة
+var THROTTLE_MS = 60;
+var NAV_SMOOTH_SCROLL = true;
+var NAV_CIRCULAR = true;
 var INITIAL_FOCUS_DELAY = 300;
+var VS_WAIT_MS = 120;  // وقت انتظار Virtual Scroller لبناء العناصر
 
 function log() {
     if (TV_DEBUG && window.console && console.log) {
@@ -30,6 +32,8 @@ var FOCUSABLE = [
     '.cat-item',
     '.ch-grid-item',
     '.media-grid-item',
+    '.ch-box',
+    '.media-box',
     '.ls-tile',
     '.ls-side-btn',
     '.match-card',
@@ -44,11 +48,10 @@ var FOCUSABLE = [
 /* ============ الحالة ============ */
 var currentEl = null;
 var _lastMoveTime = 0;
-var _isScrolling = false;
-var _domObserver = null;
+var _pendingFocus = null;
 
-/* ============ Cache للعناصر المرئية ============ */
-var _cache = { items: null, time: 0, ttl: 250 };
+/* ============ Cache ============ */
+var _cache = { items: null, time: 0, ttl: 200 };
 
 function invalidateCache() {
     _cache.items = null;
@@ -62,7 +65,6 @@ function getVisibleItems(root, forceRefresh) {
         return _cache.items;
     }
     root = root || document;
-
     var all = root.querySelectorAll(FOCUSABLE);
     var result = [];
     for (var i = 0; i < all.length; i++) {
@@ -70,42 +72,23 @@ function getVisibleItems(root, forceRefresh) {
         try {
             if (el.disabled) continue;
             if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') continue;
-
             var style = window.getComputedStyle(el);
             if (style.display === 'none') continue;
             if (style.visibility === 'hidden') continue;
             if (parseFloat(style.opacity) === 0) continue;
             if (style.pointerEvents === 'none') continue;
-
             if (el.offsetWidth === 0 || el.offsetHeight === 0) continue;
-
             var rect = el.getBoundingClientRect();
             if (rect.width < 2 || rect.height < 2) continue;
-            // تجاهل العناصر خارج الشاشة
-            if (rect.bottom < -50 || rect.top > window.innerHeight + 50) {
-                // احتفظ بها إذا كانت داخل منطقة قابلة للتمرير
-                var inScrollable = false;
-                var p = el.parentElement;
-                while (p) {
-                    var ps = window.getComputedStyle(p);
-                    if (ps.overflowY === 'auto' || ps.overflowY === 'scroll') {
-                        inScrollable = true;
-                        break;
-                    }
-                    p = p.parentElement;
-                }
-                if (!inScrollable) continue;
-            }
             result.push(el);
-        } catch (e) { /* تجاهل */ }
+        } catch (e) {}
     }
-
     _cache.items = result;
     _cache.time = now;
     return result;
 }
 
-/* ============ الحصول على مركز العنصر ============ */
+/* ============ مركز العنصر ============ */
 function getCenter(el) {
     var r = el.getBoundingClientRect();
     return {
@@ -120,7 +103,7 @@ function getCenter(el) {
     };
 }
 
-/* ============ تطبيق التركيز ============ */
+/* ============ التركيز ============ */
 function setFocus(el, skipScroll) {
     if (!el) return;
     if (currentEl && currentEl.classList) {
@@ -128,15 +111,11 @@ function setFocus(el, skipScroll) {
     }
     currentEl = el;
     el.classList.add('tv-focus');
-
-    // محاولة focus مع preventScroll
     try {
         el.focus({ preventScroll: true });
     } catch (e) {
         try { el.focus(); } catch (e2) {}
     }
-
-    // تمرير مركزي ذكي
     if (!skipScroll && NAV_SMOOTH_SCROLL) {
         try {
             var rect = el.getBoundingClientRect();
@@ -145,16 +124,13 @@ function setFocus(el, skipScroll) {
                 var pRect = scrollParent.getBoundingClientRect();
                 var offsetTop = rect.top - pRect.top;
                 var offsetBottom = rect.bottom - pRect.bottom;
-
                 if (offsetTop < 30) {
-                    // العنصر أعلى من الرؤية → مرره لأعلى
                     scrollParent.scrollTop += (offsetTop - 30);
                 } else if (offsetBottom > -30) {
-                    // العنصر أسفل من الرؤية → مرره لأسفل
                     scrollParent.scrollTop += (offsetBottom + 30);
                 }
             } else {
-                el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+                el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
             }
         } catch (e) {
             try { el.scrollIntoView(false); } catch (e2) {}
@@ -162,7 +138,7 @@ function setFocus(el, skipScroll) {
     }
 }
 
-/* ============ إيجاد أقرب أب قابل للتمرير ============ */
+/* ============ الأب القابل للتمرير ============ */
 function findScrollParent(el) {
     var p = el.parentElement;
     while (p && p !== document.body) {
@@ -176,26 +152,21 @@ function findScrollParent(el) {
     return null;
 }
 
-/* ============ البحث الاتجاهي المتقدم ============ */
+/* ============ البحث الاتجاهي ============ */
 function findInDirection(fromEl, direction) {
     if (!fromEl) return null;
     var items = getVisibleItems();
     if (items.length === 0) return null;
-
     var from = getCenter(fromEl);
     var best = null;
     var bestScore = Infinity;
-
     for (var i = 0; i < items.length; i++) {
         var el = items[i];
         if (el === fromEl) continue;
-
         var to = getCenter(el);
         var dx = to.x - from.x;
         var dy = to.y - from.y;
-
         var primaryDist, secondaryDist, isValid = false;
-
         if (direction === 'right') {
             if (dx > 5) { primaryDist = dx; secondaryDist = Math.abs(dy); isValid = true; }
         } else if (direction === 'left') {
@@ -205,53 +176,36 @@ function findInDirection(fromEl, direction) {
         } else if (direction === 'up') {
             if (dy < -5) { primaryDist = -dy; secondaryDist = Math.abs(dx); isValid = true; }
         }
-
         if (!isValid) continue;
-
-        // وزن ذكي: العناصر في نفس الصف/العمود لها أولوية أعلى
         var parallelBonus = 0;
         if (direction === 'right' || direction === 'left') {
-            // نفس الصف تقريباً (فرق رأسي < نصف ارتفاع العنصر)
             if (Math.abs(dy) < from.h * 0.5) parallelBonus = -primaryDist * 0.4;
         } else {
-            // نفس العمود تقريباً
             if (Math.abs(dx) < from.w * 0.5) parallelBonus = -primaryDist * 0.4;
         }
-
         var score = primaryDist + secondaryDist * 2.2 + parallelBonus;
-
         if (score < bestScore) {
             bestScore = score;
             best = el;
         }
     }
-
-    // التنقل الدائري
     if (!best && NAV_CIRCULAR) {
-        if (direction === 'right') {
-            // أول عنصر في أقصى اليسار
-            best = findExtreme(items, fromEl, 'minX');
-        } else if (direction === 'left') {
-            best = findExtreme(items, fromEl, 'maxX');
-        } else if (direction === 'down') {
-            best = findExtreme(items, fromEl, 'minY');
-        } else if (direction === 'up') {
-            best = findExtreme(items, fromEl, 'maxY');
-        }
+        if (direction === 'right') best = findExtreme(items, fromEl, 'minX');
+        else if (direction === 'left') best = findExtreme(items, fromEl, 'maxX');
+        else if (direction === 'down') best = findExtreme(items, fromEl, 'minY');
+        else if (direction === 'up') best = findExtreme(items, fromEl, 'maxY');
     }
-
     return best;
 }
 
-/* ============ إيجاد العنصر الأقصى في اتجاه معين ============ */
 function findExtreme(items, exclude, mode) {
     var best = null;
-    var bestVal = mode === 'minX' || mode === 'minY' ? Infinity : -Infinity;
+    var bestVal = (mode === 'minX' || mode === 'minY') ? Infinity : -Infinity;
     for (var i = 0; i < items.length; i++) {
         var el = items[i];
         if (el === exclude) continue;
         var c = getCenter(el);
-        var v = mode === 'minX' ? c.x : mode === 'maxX' ? c.x : mode === 'minY' ? c.y : c.y;
+        var v = (mode === 'minX' || mode === 'maxX') ? c.x : c.y;
         if (mode === 'minX' || mode === 'minY') {
             if (v < bestVal) { bestVal = v; best = el; }
         } else {
@@ -261,7 +215,7 @@ function findExtreme(items, exclude, mode) {
     return best;
 }
 
-/* ============ تحديد منطقة العنصر ============ */
+/* ============ المنطقة ============ */
 function getRegion(el) {
     if (!el || !el.closest) return null;
     if (el.closest('#catPanel')) return 'catPanel';
@@ -284,16 +238,124 @@ function getRegion(el) {
     return 'other';
 }
 
+/* ================================================================
+   ============ الحل الجذري: التواصل مع VS مباشرة ============
+   ================================================================ */
+
+/* جلب أول عنصر مرئي داخل chList */
+function getFirstChListItem() {
+    var chList = document.getElementById('chList');
+    if (!chList) return null;
+
+    // 1) حاول استخدام VS إذا كان متاحاً
+    if (window.VS && window.VS.items && window.VS.items.length > 0) {
+        // VS منشئ العناصر فقط عند التمرير
+        // scrollTo(0) يعيد التمرير لأول عنصر
+        try { window.VS.scrollTo(0); } catch (e) {}
+    }
+
+    // 2) ابحث عن أي عنصر مرئي بأي من الفئات المحتملة
+    var selectors = ['.ch-grid-item', '.media-grid-item', '.ch-box', '.media-box'];
+    for (var s = 0; s < selectors.length; s++) {
+        var items = chList.querySelectorAll(selectors[s]);
+        for (var i = 0; i < items.length; i++) {
+            var el = items[i];
+            var st = window.getComputedStyle(el);
+            if (st.display !== 'none' && st.visibility !== 'hidden' &&
+                el.offsetWidth > 0 && el.offsetHeight > 0) {
+                return el;
+            }
+        }
+    }
+
+    // 3) ابحث داخل .vs-inner بشكل خاص
+    var inner = chList.querySelector('.vs-inner');
+    if (inner) {
+        var children = inner.children;
+        for (var j = 0; j < children.length; j++) {
+            var c = children[j];
+            if (c.offsetWidth > 0 && c.offsetHeight > 0) return c;
+        }
+    }
+
+    return null;
+}
+
+/* الانتقال من catPanel إلى chList مع انتظار VS */
+function goFromCatToChannels() {
+    // المسار 1: حاول فوراً
+    var first = getFirstChListItem();
+    if (first) {
+        setFocus(first);
+        return true;
+    }
+
+    // المسار 2: انتظر VS يبني العناصر ثم حاول مرة أخرى
+    if (window.VS && window.VS.items && window.VS.items.length > 0) {
+        // VS موجود لكنه لم يبنِ العناصر بعد
+        // scrollTo(0) يجبره على البناء
+        try { window.VS.scrollTo(0); } catch (e) {}
+
+        setTimeout(function() {
+            var retry = getFirstChListItem();
+            if (retry) {
+                setFocus(retry);
+            } else {
+                // محاولة أخيرة بعد وقت أطول
+                setTimeout(function() {
+                    var retry2 = getFirstChListItem();
+                    if (retry2) setFocus(retry2);
+                }, VS_WAIT_MS * 2);
+            }
+        }, VS_WAIT_MS);
+
+        return true;
+    }
+
+    // المسار 3: لا VS — قد تكون القنوات غير محمّلة بعد
+    // انتظر قليلاً ثم حاول
+    setTimeout(function() {
+        var retry = getFirstChListItem();
+        if (retry) setFocus(retry);
+    }, VS_WAIT_MS);
+
+    return true;
+}
+
+/* الانتقال من chList إلى catPanel */
+function goFromChannelsToCat(isMobile) {
+    var targetId = isMobile ? 'catListMob' : 'catList';
+    var catList = document.getElementById(targetId);
+    if (!catList) {
+        // جرّب الاثنين
+        catList = document.getElementById('catList') || document.getElementById('catListMob');
+    }
+    if (!catList) return false;
+
+    // ابحث عن النشط
+    var active = catList.querySelector('.cat-item.active');
+    if (active && active.offsetWidth > 0 && active.offsetHeight > 0) {
+        setFocus(active);
+        return true;
+    }
+    // ابحث عن آخر عنصر مرئي
+    var items = catList.querySelectorAll('.cat-item');
+    for (var i = items.length - 1; i >= 0; i--) {
+        var el = items[i];
+        if (el.offsetWidth > 0 && el.offsetHeight > 0) {
+            setFocus(el);
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ============ معالجة الأسهم ============ */
 function moveFocus(direction) {
     var now = Date.now();
-    if (now - _lastMoveTime < THROTTLE_MS) {
-        log('throttled');
-        return;
-    }
+    if (now - _lastMoveTime < THROTTLE_MS) return;
     _lastMoveTime = now;
 
-    // إذا لم يكن هناك عنصر محدد، اختر الأول
     if (!currentEl) {
         var all = getVisibleItems();
         if (all.length > 0) setFocus(all[0]);
@@ -302,41 +364,18 @@ function moveFocus(direction) {
 
     var region = getRegion(currentEl);
 
-    /* -------- منطق خاص: قائمة التصنيفات → القنوات -------- */
+    /* -------- يمين من قائمة التصنيفات → القنوات -------- */
     if (direction === 'right' && (region === 'catPanel' || region === 'catListMob')) {
-        var chList = document.getElementById('chList');
-        if (chList) {
-            var chItems = getVisibleItems(chList, true);
-            if (chItems.length > 0) {
-                setFocus(chItems[0]);
-                return;
-            }
-        }
+        if (goFromCatToChannels()) return;
     }
 
-    /* -------- منطق خاص: القنوات → قائمة التصنيفات -------- */
+    /* -------- شمال من القنوات → قائمة التصنيفات -------- */
     if (direction === 'left' && region === 'chList') {
         var isMobile = window.innerWidth <= 768;
-        if (isMobile) {
-            var mobList = document.getElementById('catListMob');
-            if (mobList) {
-                var activeMob = mobList.querySelector('.cat-item.active');
-                if (activeMob) { setFocus(activeMob); return; }
-                var mobItems = getVisibleItems(mobList, true);
-                if (mobItems.length > 0) { setFocus(mobItems[mobItems.length - 1]); return; }
-            }
-        } else {
-            var catList = document.getElementById('catList');
-            if (catList) {
-                var active = catList.querySelector('.cat-item.active');
-                if (active) { setFocus(active); return; }
-                var catItems = getVisibleItems(catList, true);
-                if (catItems.length > 0) { setFocus(catItems[catItems.length - 1]); return; }
-            }
-        }
+        if (goFromChannelsToCat(isMobile)) return;
     }
 
-    /* -------- منطق خاص: من الهيدر → المحتوى -------- */
+    /* -------- من الهيدر → المحتوى -------- */
     if (direction === 'down' && region === 'header') {
         var appShell = document.getElementById('appShell');
         if (appShell && appShell.classList.contains('show')) {
@@ -349,64 +388,25 @@ function moveFocus(direction) {
     var next = findInDirection(currentEl, direction);
     if (next) {
         setFocus(next);
-    } else {
-        log('no element in direction:', direction);
     }
 }
 
-/* ============ تفعيل العنصر ============ */
+/* ============ التفعيل ============ */
 function activateCurrent() {
     if (!currentEl) return;
-
-    var el = currentEl;
-
-    // محاولة click عادي
+    try { currentEl.click(); return; } catch (e) {}
     try {
-        el.click();
+        var evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+        currentEl.dispatchEvent(evt);
         return;
-    } catch (e) {
-        log('click() failed', e);
-    }
-
-    // محاولة MouseEvent
+    } catch (e) {}
     try {
-        var evt = new MouseEvent('click', {
-            bubbles: true,
-            cancelable: true,
-            view: window
-        });
-        el.dispatchEvent(evt);
-        return;
-    } catch (e) {
-        log('MouseEvent failed', e);
-    }
-
-    // محاولة TouchEvent
-    try {
-        var touch = new Touch({
-            identifier: Date.now(),
-            target: el,
-            clientX: 0,
-            clientY: 0
-        });
-        var tEvt = new TouchEvent('touchend', {
-            bubbles: true,
-            cancelable: true,
-            touches: [],
-            targetTouches: [],
-            changedTouches: [touch]
-        });
-        el.dispatchEvent(tEvt);
-    } catch (e) {
-        // آخر حل: Enter keydown
-        try {
-            var kEvt = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
-            el.dispatchEvent(kEvt);
-        } catch (e2) {}
-    }
+        var kEvt = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
+        currentEl.dispatchEvent(kEvt);
+    } catch (e) {}
 }
 
-/* ============ معالجة ضغطات المفاتيح ============ */
+/* ============ لوحة المفاتيح ============ */
 document.addEventListener('keydown', function(e) {
     var key = e.key || '';
     var code = e.keyCode || e.which || 0;
@@ -422,70 +422,37 @@ document.addEventListener('keydown', function(e) {
     var isPageDown = key === 'PageDown' || code === 34;
     var isPageUp = key === 'PageUp' || code === 33;
 
-    // تجاهل الأسهم داخل input
     var active = document.activeElement;
     var tag = active ? active.tagName : '';
     if ((tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') && !isEnter) {
         if (isRight || isLeft || isUp || isDown) return;
     }
 
-    if (isRight) {
-        e.preventDefault();
-        e.stopPropagation();
-        moveFocus('right');
-    } else if (isLeft) {
-        e.preventDefault();
-        e.stopPropagation();
-        moveFocus('left');
-    } else if (isDown || isPageDown) {
-        e.preventDefault();
-        e.stopPropagation();
-        moveFocus('down');
-    } else if (isUp || isPageUp) {
-        e.preventDefault();
-        e.stopPropagation();
-        moveFocus('up');
-    } else if (isEnter) {
-        e.preventDefault();
-        e.stopPropagation();
-        activateCurrent();
-    } else if (isBack) {
-        e.preventDefault();
-        e.stopPropagation();
-        if (typeof window.FlashTV_BackHandler === 'function') {
-            window.FlashTV_BackHandler();
-        }
-    } else if (isHome) {
-        e.preventDefault();
-        var items = getVisibleItems();
-        if (items.length > 0) setFocus(items[0]);
-    } else if (isEnd) {
-        e.preventDefault();
-        var items2 = getVisibleItems();
-        if (items2.length > 0) setFocus(items2[items2.length - 1]);
+    if (isRight) { e.preventDefault(); e.stopPropagation(); moveFocus('right'); }
+    else if (isLeft) { e.preventDefault(); e.stopPropagation(); moveFocus('left'); }
+    else if (isDown || isPageDown) { e.preventDefault(); e.stopPropagation(); moveFocus('down'); }
+    else if (isUp || isPageUp) { e.preventDefault(); e.stopPropagation(); moveFocus('up'); }
+    else if (isEnter) { e.preventDefault(); e.stopPropagation(); activateCurrent(); }
+    else if (isBack) {
+        e.preventDefault(); e.stopPropagation();
+        if (typeof window.FlashTV_BackHandler === 'function') window.FlashTV_BackHandler();
     }
+    else if (isHome) { e.preventDefault(); var i1 = getVisibleItems(); if (i1.length > 0) setFocus(i1[0]); }
+    else if (isEnd) { e.preventDefault(); var i2 = getVisibleItems(); if (i2.length > 0) setFocus(i2[i2.length - 1]); }
 }, true);
 
-/* ============ تحديث currentEl عند تمرير الماوس ============ */
+/* ============ الماوس ============ */
 document.addEventListener('mouseover', function(e) {
     var t = e.target;
     if (!t || !t.closest) return;
     var el = t.closest(FOCUSABLE);
-    if (!el) return;
-    if (currentEl === el) return;
-
-    var items = getVisibleItems();
-    for (var i = 0; i < items.length; i++) {
-        if (items[i] === el) {
-            if (currentEl && currentEl.classList) currentEl.classList.remove('tv-focus');
-            currentEl = el;
-            el.classList.add('tv-focus');
-            return;
-        }
-    }
+    if (!el || el === currentEl) return;
+    if (currentEl && currentEl.classList) currentEl.classList.remove('tv-focus');
+    currentEl = el;
+    el.classList.add('tv-focus');
 }, false);
 
-/* ============ عند تحميل الصفحة ============ */
+/* ============ التركيز الابتدائي ============ */
 function initialFocus() {
     setTimeout(function() {
         if (!currentEl) {
@@ -494,19 +461,14 @@ function initialFocus() {
         }
     }, INITIAL_FOCUS_DELAY);
 }
+if (document.readyState === 'complete') initialFocus();
+else window.addEventListener('load', initialFocus);
 
-if (document.readyState === 'complete') {
-    initialFocus();
-} else {
-    window.addEventListener('load', initialFocus);
-}
-
-/* ============ مراقبة DOM لتحديث Cache ============ */
+/* ============ مراقبة DOM ============ */
 if (window.MutationObserver) {
     var _mutateTimer = null;
-    _domObserver = new MutationObserver(function() {
+    var observer = new MutationObserver(function() {
         invalidateCache();
-        // إذا اختفى العنصر الحالي، ابحث عن بديل
         if (currentEl && !document.body.contains(currentEl)) {
             currentEl = null;
             clearTimeout(_mutateTimer);
@@ -516,7 +478,7 @@ if (window.MutationObserver) {
             }, 200);
         }
     });
-    _domObserver.observe(document.body || document.documentElement, {
+    observer.observe(document.body || document.documentElement, {
         childList: true,
         subtree: true,
         attributes: true,
@@ -524,31 +486,20 @@ if (window.MutationObserver) {
     });
 }
 
-/* ============ مراقبة تغيير حجم الشاشة ============ */
+/* ============ resize ============ */
 var _resizeTimer = null;
 window.addEventListener('resize', function() {
     clearTimeout(_resizeTimer);
     _resizeTimer = setTimeout(function() {
         invalidateCache();
-        if (currentEl && document.body.contains(currentEl)) {
-            setFocus(currentEl, true);
-        }
+        if (currentEl && document.body.contains(currentEl)) setFocus(currentEl, true);
     }, 200);
 });
 
-/* ============ مراقبة تغيير التمرير ============ */
-window.addEventListener('scroll', function() {
-    invalidateCache();
-}, { passive: true, capture: true });
+/* ============ scroll ============ */
+window.addEventListener('scroll', function() { invalidateCache(); }, { passive: true, capture: true });
 
-/* ============ كشف فشل الصور ============ */
-window.addEventListener('error', function(e) {
-    if (e.target && e.target.tagName === 'IMG') {
-        invalidateCache();
-    }
-}, true);
-
-/* ============ تصدير API عام للاستخدام الخارجي ============ */
+/* ============ API عام ============ */
 window.FlashTV_Nav = {
     focusFirst: function() {
         var items = getVisibleItems(null, true);
@@ -558,9 +509,11 @@ window.FlashTV_Nav = {
     move: moveFocus,
     activate: activateCurrent,
     refresh: invalidateCache,
+    goToChannels: goFromCatToChannels,
+    goToCategories: function() { return goFromChannelsToCat(window.innerWidth <= 768); },
     getCurrent: function() { return currentEl; }
 };
 
-log('✅ FLASH TV Nav v2.0 loaded - advanced navigation ready');
+log('✅ FLASH TV Nav v3.0 loaded - VS integrated');
 
 })();
